@@ -1,0 +1,71 @@
+# Local / staging stack: PostgreSQL, Redis, one-off migration, API, Celery worker, Celery beat (scheduler).
+# Copy .env.example to .env first. This file overrides only the host names and paths that differ inside Docker.
+x-backend: &backend
+  build: ./backend
+  env_file: .env
+  environment: &backend-env
+    DATABASE_URL: postgresql+psycopg://techradar:${POSTGRES_PASSWORD:-techradar}@db:5432/techradar
+    REDIS_URL: redis://redis:6379/0
+    STORAGE_DIR: /data/storage
+  volumes:
+    - storage:/data/storage
+  restart: unless-stopped
+
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: techradar
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-techradar}
+      POSTGRES_DB: techradar
+    ports: ["5432:5432"]
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U techradar -d techradar"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7
+    command: ["redis-server", "--appendonly", "yes"]
+    ports: ["6379:6379"]
+    volumes: ["redisdata:/data"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  migrate:  # runs once, so API replicas never race each other applying migrations
+    <<: *backend
+    command: ["alembic", "upgrade", "head"]
+    restart: "no"
+    depends_on:
+      db: {condition: service_healthy}
+
+  api:
+    <<: *backend
+    ports: ["8000:8000"]
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+      redis: {condition: service_healthy}
+
+  worker:
+    <<: *backend
+    command: ["celery", "-A", "app.worker.celery_app", "worker", "--loglevel=INFO", "--concurrency=2"]
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+      redis: {condition: service_healthy}
+
+  beat:  # exactly ONE of these must run; it only schedules, the worker does the work
+    <<: *backend
+    command: ["celery", "-A", "app.worker.celery_app", "beat", "--loglevel=INFO", "-s", "/tmp/celerybeat-schedule"]
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+      redis: {condition: service_healthy}
+
+volumes:
+  pgdata:
+  redisdata:
+  storage:
